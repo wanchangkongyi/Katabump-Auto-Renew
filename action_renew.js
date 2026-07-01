@@ -157,22 +157,36 @@ function checkPort(port) {
     });
 }
 
+const CHROME_PROFILE_DIR = '/tmp/chrome_user_data';
+
 async function launchChrome() {
     console.log('检查 Chrome 是否已在端口 ' + DEBUG_PORT + ' 上运行...');
     if (await checkPort(DEBUG_PORT)) {
         console.log('Chrome 已开启。');
         return;
     }
+
+    // 安全加固：启动前清空旧的 profile 目录，避免遗留的 cookie/session/cache
+    // 跨次运行残留（尤其是 self-hosted runner 复用同一台机器的场景）。
+    try {
+        fs.rmSync(CHROME_PROFILE_DIR, { recursive: true, force: true });
+    } catch (e) {
+        console.log('[Chrome] 清理旧 profile 目录失败（可忽略）:', e.message);
+    }
+
     console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
     const args = [
         `--remote-debugging-port=${DEBUG_PORT}`,
+        // 安全加固：显式绑定调试端口到回环地址，防止在某些环境下
+        // CDP 端口意外监听在 0.0.0.0 上而被同网络的其他进程/容器访问。
+        '--remote-debugging-address=127.0.0.1',
         '--no-first-run',
         '--no-default-browser-check',
         '--disable-gpu',
         `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--user-data-dir=/tmp/chrome_user_data',
+        `--user-data-dir=${CHROME_PROFILE_DIR}`,
         '--disable-dev-shm-usage'
     ];
     if (PROXY_CONFIG) {
@@ -221,6 +235,16 @@ function maskUsernameForLog(username) {
     const domain = value.slice(atIndex + 1);
     const maskedName = name.length <= 2 ? `${name[0] || '*'}*` : `${name.slice(0, 2)}***`;
     return `${maskedName}@${domain}`;
+}
+
+// --- 安全加固：文件名（截图文件名）一律使用脱敏后的用户名 ---
+// 旧实现直接用 user.username.replace(/[^a-z0-9]/gi, '_') 生成文件名，
+// 只是把符号换成下划线，完整邮箱地址仍然原样留在文件名里。
+// 一旦截图作为 workflow artifact 上传，文件名本身就会泄露完整账号，
+// 这里统一改成基于 maskUsernameForLog() 的结果生成文件名。
+function safeFileName(username) {
+    const masked = maskUsernameForLog(username);
+    return masked.replace(/[^a-z0-9]/gi, '_').replace(/_+/g, '_').slice(0, 60) || 'user';
 }
 
 function getUsers() {
@@ -701,6 +725,24 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 await page.addInitScript(INJECTED_SCRIPT);
             }
 
+            // 安全加固：每个账号开始前，强制清空 cookies 以及页面的
+            // localStorage/sessionStorage。原逻辑只依赖访问 /auth/logout
+            // 来结束会话，一旦该请求失败或页面异常，下一个账号可能会在
+            // 上一个账号残留的会话/本地存储基础上运行，存在跨账号串号风险。
+            try {
+                await context.clearCookies();
+            } catch (e) {
+                console.log('[会话隔离] 清空 cookies 失败:', e.message);
+            }
+            try {
+                await page.evaluate(() => {
+                    try { window.localStorage.clear(); } catch (e) {}
+                    try { window.sessionStorage.clear(); } catch (e) {}
+                });
+            } catch (e) {
+                // 页面可能还未导航到目标站点，evaluate 失败属正常情况，忽略即可
+            }
+
             // 1. 先确保已登出，再访问登录页
             console.log('确保已登出...');
             if (page.url().includes('dashboard')) {
@@ -743,7 +785,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                         console.error(`   >> ❌ 登录失败: 账号或密码错误`);
                         const failPhotoDir = path.join(process.cwd(), 'screenshots');
                         if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
-                        const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
+                        const failSafe = safeFileName(user.username);
                         const failScreenshot = path.join(failPhotoDir, `${failSafe}_login_fail.png`);
                         try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
                         await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n登录失败: 账号或密码错误`, failScreenshot);
@@ -803,7 +845,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                         
                         const photoDir = path.join(process.cwd(), 'screenshots');
                         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                        const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
+                        const safeUsername = safeFileName(user.username);
                         const captchaScreenshotName = `${safeUsername}_ALTCHA_${attempt}.png`;
                         try {
                             await saveViewportScreenshot(page, path.join(photoDir, captchaScreenshotName));
@@ -922,7 +964,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 console.log('   >> ❌ Renew 全部尝试失败。');
                 const failDir = path.join(process.cwd(), 'screenshots');
                 if (!fs.existsSync(failDir)) fs.mkdirSync(failDir, { recursive: true });
-                const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
+                const failSafe = safeFileName(user.username);
                 const failScreenshot = path.join(failDir, `${failSafe}_renew_fail.png`);
                 try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
                 await sendTelegramMessage(`❌ *${escapeMarkdown(user.username)}*\n${renewFailureReason}`, failScreenshot);
@@ -934,7 +976,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 
         const photoDir = path.join(process.cwd(), 'screenshots');
         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-        const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
+        const safeUsername = safeFileName(user.username);
         try {
             await saveViewportScreenshot(page, path.join(photoDir, `${safeUsername}.png`));
         } catch (e) {}
